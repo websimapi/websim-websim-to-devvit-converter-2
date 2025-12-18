@@ -38,13 +38,11 @@ export class DependencyManager {
     }
 
     // Resolves an import. 
-    // referrerUrl is the absolute URL of the file importing this, or null if it's the root project.
     resolve(importSource, referrerUrl = null) {
-        // 1. Determine URL
         let downloadUrl;
         
+        // 1. Determine URL
         if (referrerUrl) {
-            // Relative to referrer (inside a vendor file)
             try {
                 if (importSource.startsWith('.')) {
                     downloadUrl = new URL(importSource, referrerUrl).href;
@@ -54,31 +52,58 @@ export class DependencyManager {
                      const origin = new URL(referrerUrl).origin;
                      downloadUrl = new URL(importSource, origin).href;
                 } else {
-                    // Bare import in vendor? Assume fresh fetch from esm.sh
                     downloadUrl = `https://esm.sh/${importSource}?target=es2020&bundle&deps-inline=true`;
                 }
             } catch (e) {
-                console.warn("Failed to resolve URL", importSource, referrerUrl);
                 return importSource;
             }
         } else {
-            // Root (User Code) Import
             if (importSource.startsWith('.') || importSource.startsWith('/')) {
-                return importSource; // Local project file, ignore
+                return importSource; 
             }
             if (importSource.startsWith('http')) {
                 downloadUrl = importSource;
             } else {
-                // Bare specifier
                 downloadUrl = `https://esm.sh/${importSource}?target=es2020&bundle&deps-inline=true`;
             }
         }
 
-        // 1.5. Canonicalize (Deduplication)
-        // Check if this URL maps to a known singleton library
+        // 1.5. Canonicalize
         const canonical = this.normalizeLibraryUrl(downloadUrl || importSource);
         if (canonical) {
             downloadUrl = canonical;
+        }
+
+        // --- SPECIAL: Three.js Wrapper (Global Shim) ---
+        // Generates a wrapper file that exports Three modules AND sets window.THREE
+        if (downloadUrl && (downloadUrl.includes('/three@') || downloadUrl.includes('/three.js')) && !downloadUrl.includes('/addons/')) {
+            const coreUrl = downloadUrl;
+            const corePath = './vendor/three-core.js';
+            const wrapperPath = './vendor/three.js';
+            const wrapperKey = 'virtual:three-global-wrapper';
+
+            // Ensure core is downloaded
+            if (!this.downloads.has(coreUrl)) {
+                this.downloads.set(coreUrl, {
+                    localPath: corePath,
+                    processPromise: this._fetchAndProcess(coreUrl)
+                });
+            }
+
+            // Ensure wrapper exists
+            if (!this.downloads.has(wrapperKey)) {
+                this.downloads.set(wrapperKey, {
+                    localPath: wrapperPath,
+                    processPromise: Promise.resolve(`
+import * as THREE from './three-core.js';
+if (typeof window !== 'undefined') {
+    window.THREE = THREE;
+}
+export * from './three-core.js';
+`)
+                });
+            }
+            return wrapperPath;
         }
 
         // 2. Check Cache
@@ -86,7 +111,7 @@ export class DependencyManager {
             return this.downloads.get(downloadUrl).localPath;
         }
 
-        // 3. Generate Local Path (Force .js)
+        // 3. Generate Local Path
         let safeName = `vendor-${this.vendorCount++}`;
         try {
             const u = new URL(downloadUrl);
@@ -100,47 +125,48 @@ export class DependencyManager {
         
         const localPath = `./vendor/${safeName}.js`;
 
-        // 4. Start Download & Recursion
-        const processPromise = (async () => {
-            try {
-                const res = await fetch(downloadUrl);
-                if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
-                let code = await res.text();
-
-                // Recursively rewrite imports in this vendor file
-                const rewritePath = (specifier) => {
-                     // Resolve the specifier relative to this download
-                     const resolvedLocal = this.resolve(specifier, downloadUrl);
-                     
-                     // resolvedLocal is ./vendor/xyz.js
-                     // Since this file is also in ./vendor/, imports should be ./xyz.js
-                     const parts = resolvedLocal.split('/');
-                     return `./${parts[parts.length - 1]}`;
-                };
-
-                const regex = /(from\s*['"]|import\s*['"]|import\s*\(\s*['"])([^'"]+)(['"]\s*\)?)/g;
-                code = code.replace(regex, (match, prefix, src, suffix) => {
-                    // Skip non-imports or absolute/data URLs if resolve doesn't handle them
-                    if (src.startsWith('data:')) return match;
-                    return `${prefix}${rewritePath(src)}${suffix}`;
-                });
-
-                return `// Source: ${downloadUrl}\n${code}`;
-            } catch (err) {
-                console.error("Vendor download error:", err);
-                return `/* Error downloading ${downloadUrl}: ${err.message} */`;
-            }
-        })();
-
-        this.downloads.set(downloadUrl, { localPath, processPromise });
+        // 4. Start Download
+        this.downloads.set(downloadUrl, { 
+            localPath, 
+            processPromise: this._fetchAndProcess(downloadUrl) 
+        });
+        
         return localPath;
+    }
+
+    async _fetchAndProcess(url) {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+            let code = await res.text();
+
+            const rewritePath = (specifier) => {
+                 const resolvedLocal = this.resolve(specifier, url);
+                 // If resolved is absolute/remote, it might be an issue, but usually resolve handles it.
+                 // Ensure we keep relative paths clean
+                 if (!resolvedLocal.startsWith('.')) return resolvedLocal;
+                 
+                 const parts = resolvedLocal.split('/');
+                 return `./${parts[parts.length - 1]}`;
+            };
+
+            const regex = /(from\s*['"]|import\s*['"]|import\s*\(\s*['"])([^'"]+)(['"]\s*\)?)/g;
+            code = code.replace(regex, (match, prefix, src, suffix) => {
+                if (src.startsWith('data:')) return match;
+                return `${prefix}${rewritePath(src)}${suffix}`;
+            });
+
+            return `// Source: ${url}\n${code}`;
+        } catch (err) {
+            console.error("Vendor download error:", err);
+            return `/* Error downloading ${url}: ${err.message} */`;
+        }
     }
 
     async getVendorFiles() {
         const files = {};
         const processed = new Set();
         
-        // Loop until no new downloads appear (handling recursion)
         while(true) {
             const urls = Array.from(this.downloads.keys());
             let hasNew = false;
@@ -153,7 +179,6 @@ export class DependencyManager {
                 const entry = this.downloads.get(url);
                 let content = await entry.processPromise;
                 
-                // Final safety replacement for any missed .mjs
                 content = content.replace(/from\s*['"]([^'"]+)\.mjs['"]/g, "from '$1.js'");
                 
                 const zipPath = entry.localPath.replace(/^\.\//, '');

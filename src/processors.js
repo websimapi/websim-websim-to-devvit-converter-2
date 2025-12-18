@@ -27,6 +27,29 @@ export function sanitizeFilename(filePath) {
     return [...parts, filename + ext].join('/');
 }
 
+// Helper to rewrite local paths in content (HTML src or JS imports) to match sanitized names
+export function getSanitizedPathForReference(refPath) {
+    // refPath is like "./vendor/three.core.js" or "three.core.js"
+    const parts = refPath.split('/');
+    let filename = parts.pop();
+    let ext = '.js'; // Default to js for code
+    
+    // Strip query params
+    filename = filename.split('?')[0];
+
+    // Detect and strip extension
+    if (filename.endsWith('.mjs')) {
+        filename = filename.slice(0, -4);
+    } else if (filename.endsWith('.js')) {
+        filename = filename.slice(0, -3);
+    }
+    
+    // Sanitize base name
+    filename = filename.replace(/\./g, '_');
+    
+    return [...parts, filename + ext].join('/');
+}
+
 export function uint8ToString(u8) {
   if (typeof u8 === 'string') return u8;
   if (!(u8 instanceof Uint8Array)) return String(u8 ?? '');
@@ -111,7 +134,15 @@ export class DependencyManager {
 
         // --- Three.js Direct Download ---
         // Download Three.js as a single file with inline global assignment
-        if (downloadUrl && (downloadUrl.includes('/three') || downloadUrl.includes('three.module.js')) && !downloadUrl.includes('/addons/')) {
+        // Also catch "three.core.js" or "three.min.js" which are often the core lib
+        const isThreeCore = downloadUrl && (
+            downloadUrl.includes('/three.js') || 
+            downloadUrl.includes('/three.module.js') || 
+            downloadUrl.includes('/three.core.js') ||
+            downloadUrl.includes('/three.min.js')
+        );
+
+        if (isThreeCore && !downloadUrl.includes('/addons/')) {
             const threePath = './vendor/three.js';
             
             if (!this.downloads.has(downloadUrl)) {
@@ -301,19 +332,7 @@ export function processJsForImports(jsContent, depManager, filePath) {
       // 2. Local Imports - Sanitize Filenames
       // If the source looks like a JS file, apply the same sanitization we apply to the file assets
       if (source.endsWith('.js') || source.endsWith('.mjs')) {
-          const parts = source.split('/');
-          let filename = parts.pop();
-          
-          let ext = '.js'; 
-          let nameBase = filename;
-          
-          if (nameBase.endsWith('.mjs')) nameBase = nameBase.slice(0, -4);
-          else if (nameBase.endsWith('.js')) nameBase = nameBase.slice(0, -3);
-          
-          // Apply substitution: dots -> underscores
-          nameBase = nameBase.replace(/\./g, '_');
-          
-          const newSource = [...parts, nameBase + ext].join('/');
+          const newSource = getSanitizedPathForReference(source);
           return `${prefix}${newSource}${suffix}`;
       }
       
@@ -416,6 +435,14 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
             return `<script ${newAttrs}></script>`;
         }
 
+        // Local Script: Rewrite path to match sanitized filename logic
+        const sanitizedSrc = getSanitizedPathForReference(src);
+        if (sanitizedSrc !== src) {
+             const newSrc = sanitizedSrc;
+             attrs = attrs.replace(srcMatch[1], newSrc);
+             src = newSrc;
+        }
+
         const dir = filePath.split('/').slice(0, -1).join('/');
         const fullLocalPath = dir ? normalizePath(`${dir}/${src}`) : normalizePath(src);
         
@@ -430,7 +457,7 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
         if (found && !attrs.includes('type="module"')) {
             return `<script type="module" ${attrs}></script>`;
         }
-        return match;
+        return `<script ${attrs}>${content}</script>`;
     }
 
     if (!content.trim() || attrs.includes('type="application/json"')) return match;

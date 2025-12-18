@@ -95,10 +95,12 @@ export class DependencyManager {
                 this.downloads.set(wrapperKey, {
                     localPath: wrapperPath,
                     processPromise: Promise.resolve(`
-import * as THREE from './three-core.js';
+import * as THREE_NS from './three-core.js';
+const THREE = (THREE_NS && THREE_NS.default) ? THREE_NS.default : THREE_NS;
 if (typeof window !== 'undefined') {
     window.THREE = THREE;
 }
+export default THREE;
 export * from './three-core.js';
 `)
                 });
@@ -214,10 +216,11 @@ export function processJsForImports(jsContent, depManager, filePath) {
   }
   
   // Fix Common Legacy Import Issues
-  // Detects "import TWEEN from" and converts to "import * as TWEEN from"
-  // This handles the case where libraries export named exports but user code expects a default namespace.
-  js = js.replace(/import\s+TWEEN\s+from/g, 'import * as TWEEN from');
-  js = js.replace(/import\s+THREE\s+from/g, 'import * as THREE from');
+
+  // Heuristic: If script uses global THREE, treat it as a module so it waits for vendor injection
+  if (js.includes('THREE.') || js.includes('new THREE')) {
+      isModule = true;
+  }
 
   // Regex to match imports:
   // 1. import ... from "..."
@@ -295,9 +298,15 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
         if (src.startsWith('http') || src.startsWith('//')) {
             if (src.startsWith('//')) src = 'https:' + src;
             const localPath = depManager.resolve(src);
-            // resolve returns ./vendor/..., remove ./ for src attribute if needed, 
-            // but browsers handle ./ fine.
-            return `<script ${attrs.replace(srcMatch[0], `src="${localPath}"`)}>${content}</script>`;
+            
+            let newAttrs = attrs.replace(srcMatch[0], `src="${localPath}"`);
+            
+            // Force type="module" for downloaded dependencies (esm.sh) to ensure they load correctly
+            if (!newAttrs.includes('type="module"') && !newAttrs.includes("type='module'")) {
+                 newAttrs += ' type="module"';
+            }
+
+            return `<script ${newAttrs}>${content}</script>`;
         }
 
         let filename = src;

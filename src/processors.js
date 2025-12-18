@@ -17,6 +17,26 @@ export class DependencyManager {
         this.vendorCount = 0;
     }
 
+    normalizeLibraryUrl(url) {
+        if (!url) return null;
+        const lower = url.toLowerCase();
+        
+        // Force singleton Three.js
+        if (lower.includes('/three@') || lower.endsWith('/three') || lower.endsWith('/three.js') || lower === 'three') {
+             // Avoid addons/examples
+             if (!lower.includes('/addons/') && !lower.includes('/examples/') && !lower.includes('three-')) {
+                 return 'https://esm.sh/three@0.160.0?target=es2020';
+             }
+        }
+        
+        // Force singleton Tween.js
+        if (lower.includes('tween.js') || lower === '@tweenjs/tween.js') {
+            return 'https://esm.sh/@tweenjs/tween.js@23.1.1?target=es2020';
+        }
+        
+        return null;
+    }
+
     // Resolves an import. 
     // referrerUrl is the absolute URL of the file importing this, or null if it's the root project.
     resolve(importSource, referrerUrl = null) {
@@ -52,6 +72,13 @@ export class DependencyManager {
                 // Bare specifier
                 downloadUrl = `https://esm.sh/${importSource}?target=es2020&bundle&deps-inline=true`;
             }
+        }
+
+        // 1.5. Canonicalize (Deduplication)
+        // Check if this URL maps to a known singleton library
+        const canonical = this.normalizeLibraryUrl(downloadUrl || importSource);
+        if (canonical) {
+            downloadUrl = canonical;
         }
 
         // 2. Check Cache
@@ -161,6 +188,12 @@ export function processJsForImports(jsContent, depManager, filePath) {
     isModule = true;
   }
   
+  // Fix Common Legacy Import Issues
+  // Detects "import TWEEN from" and converts to "import * as TWEEN from"
+  // This handles the case where libraries export named exports but user code expects a default namespace.
+  js = js.replace(/import\s+TWEEN\s+from/g, 'import * as TWEEN from');
+  js = js.replace(/import\s+THREE\s+from/g, 'import * as THREE from');
+
   // Regex to match imports:
   // 1. import ... from "..."
   // 2. export ... from "..."

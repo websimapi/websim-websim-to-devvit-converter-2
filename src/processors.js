@@ -85,59 +85,18 @@ export class DependencyManager {
             downloadUrl = canonical;
         }
 
-        // --- Three.js Global Shim ---
-        // We intercept ANY attempt to load three.js core and force our shim pattern.
+        // --- Three.js Direct Download ---
+        // Download Three.js as a single file with inline global assignment
         if (downloadUrl && (downloadUrl.includes('/three') || downloadUrl.includes('three.module.js')) && !downloadUrl.includes('/addons/')) {
-            const coreUrl = downloadUrl;
-            const wrapperPath = './vendor/three.js';
-            const wrapperKey = 'virtual:three-global-wrapper';
+            const threePath = './vendor/three.js';
             
-            // Note: We use underscore 'three_core.js' to minimize MIME confusion with double dots in some server envs
-            const coreFilename = 'three_core.js';
-            const corePath = `./vendor/${coreFilename}`;
-
-            // Ensure we register the core download, even if wrapper exists (idempotent)
-            if (!this.downloads.has(coreUrl)) {
-                 this.downloads.set(coreUrl, {
-                    localPath: corePath,
-                    processPromise: this._fetchAndProcess(coreUrl, false) // Don't mangle huge three.js
+            if (!this.downloads.has(downloadUrl)) {
+                this.downloads.set(downloadUrl, {
+                    localPath: threePath,
+                    processPromise: this._fetchThreeJs(downloadUrl)
                 });
             }
-
-            if (!this.downloads.has(wrapperKey)) {
-                this.downloads.set(wrapperKey, {
-                    localPath: wrapperPath,
-                    processPromise: Promise.resolve(`
-import * as THREE_NS from './${coreFilename}';
-const THREE = {};
-// Robust property copy
-const copy = (src) => {
-    if (!src) return;
-    for (const key of Object.getOwnPropertyNames(src)) {
-        if (key === 'default' || key === '__esModule') continue;
-        try { 
-            Object.defineProperty(THREE, key, Object.getOwnPropertyDescriptor(src, key));
-        } catch(e) { THREE[key] = src[key]; }
-    }
-};
-copy(THREE_NS);
-// Also copy default export if it's the namespace itself (common in some bundlers)
-if (THREE_NS.default && typeof THREE_NS.default === 'object') copy(THREE_NS.default);
-
-if (typeof window !== 'undefined') {
-    window.THREE = THREE;
-    console.log('[WebSim] THREE.js Shim: Global window.THREE initialized.', { 
-        rev: THREE.REVISION, 
-        hasScene: !!THREE.Scene,
-        keys: Object.keys(THREE).length
-    });
-}
-export default THREE;
-export * from './${coreFilename}';
-`)
-                });
-            }
-            return wrapperPath;
+            return threePath;
         }
 
         if (this.downloads.has(downloadUrl)) {
@@ -168,6 +127,23 @@ export * from './${coreFilename}';
         });
         
         return localPath;
+    }
+
+    async _fetchThreeJs(url) {
+        try {
+            const res = await fetch(url);
+            if (!res.ok) throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);
+            
+            let code = await res.text();
+            
+            // Append global assignment at the end
+            code += `\n\n// Auto-injected global\nif (typeof window !== 'undefined') {\n  window.THREE = {};\n  for (const key in exports) {\n    if (key !== 'default' && key !== '__esModule') window.THREE[key] = exports[key];\n  }\n  if (exports.default) Object.assign(window.THREE, exports.default);\n  console.log('[WebSim] THREE.js loaded globally', { keys: Object.keys(window.THREE).length });\n}\n`;
+            
+            return `// Source: ${url}\n${code}`;
+        } catch (err) {
+            console.error("Three.js download error:", err);
+            return `/* Error downloading ${url}: ${err.message} */`;
+        }
     }
 
     async _fetchAndProcess(url, shouldRewrite = true) {

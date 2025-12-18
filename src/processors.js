@@ -25,13 +25,13 @@ export class DependencyManager {
         if (lower.includes('/three@') || lower.endsWith('/three') || lower.endsWith('/three.js') || lower === 'three') {
              // Avoid addons/examples
              if (!lower.includes('/addons/') && !lower.includes('/examples/') && !lower.includes('three-')) {
-                 return 'https://esm.sh/three@0.160.0?target=es2020';
+                 return 'https://esm.sh/three@0.160.0?target=es2020&bundle&deps-inline=true';
              }
         }
         
         // Force singleton Tween.js
         if (lower.includes('tween.js') || lower === '@tweenjs/tween.js') {
-            return 'https://esm.sh/@tweenjs/tween.js@23.1.1?target=es2020';
+            return 'https://esm.sh/@tweenjs/tween.js@23.1.1?target=es2020&bundle&deps-inline=true';
         }
         
         return null;
@@ -122,10 +122,9 @@ const THREE = {};
 
 function copyProps(src) {
     if (!src) return;
-    // Use getOwnPropertyNames to handle module namespace objects correctly
     const keys = Object.getOwnPropertyNames(src);
     for (const key of keys) {
-        if (key === 'default') continue;
+        if (key === 'default' || key === '__esModule') continue;
         try {
             THREE[key] = src[key];
         } catch(e) {}
@@ -140,15 +139,13 @@ if (THREE_NS.default && typeof THREE_NS.default === 'object') {
     copyProps(THREE_NS.default);
 }
 
-// 3. Fallback for Scene if missing
-if (!THREE.Scene && THREE_NS.Scene) THREE.Scene = THREE_NS.Scene;
-
 if (typeof window !== 'undefined') {
     window.THREE = THREE;
     console.log('[WebSim] THREE.js Shim: Global window.THREE initialized.', { 
         rev: THREE.REVISION, 
         hasScene: !!THREE.Scene,
-        keys: Object.keys(THREE).length 
+        keys: Object.keys(THREE).length,
+        nsKeys: Object.keys(THREE_NS)
     });
 }
 

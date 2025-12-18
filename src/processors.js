@@ -21,27 +21,23 @@ export class DependencyManager {
         if (!url) return null;
         const lower = url.toLowerCase();
         
-        // Force singleton Three.js
+        // Use reliable ESM builds from unpkg/esm.sh for core libs
         if (lower.includes('/three@') || lower.endsWith('/three') || lower.endsWith('/three.js') || lower === 'three') {
-             // Avoid addons/examples
              if (!lower.includes('/addons/') && !lower.includes('/examples/') && !lower.includes('three-')) {
-                 return 'https://esm.sh/three@0.160.0?target=es2020&bundle&deps-inline=true';
+                 return 'https://unpkg.com/three@0.160.0/build/three.module.js';
              }
         }
         
-        // Force singleton Tween.js
         if (lower.includes('tween.js') || lower === '@tweenjs/tween.js') {
-            return 'https://esm.sh/@tweenjs/tween.js@23.1.1?target=es2020&bundle&deps-inline=true';
+            return 'https://unpkg.com/@tweenjs/tween.js@23.1.1/dist/tween.esm.js';
         }
         
         return null;
     }
 
-    // Resolves an import. 
     resolve(importSource, referrerUrl = null) {
         let downloadUrl;
         
-        // 1. Determine URL
         if (referrerUrl) {
             try {
                 if (importSource.startsWith('.')) {
@@ -52,7 +48,7 @@ export class DependencyManager {
                      const origin = new URL(referrerUrl).origin;
                      downloadUrl = new URL(importSource, origin).href;
                 } else {
-                    downloadUrl = `https://esm.sh/${importSource}?target=es2020&bundle&deps-inline=true`;
+                    downloadUrl = `https://esm.sh/${importSource}?target=es2020`;
                 }
             } catch (e) {
                 return importSource;
@@ -64,105 +60,63 @@ export class DependencyManager {
             if (importSource.startsWith('http')) {
                 downloadUrl = importSource;
             } else {
-                downloadUrl = `https://esm.sh/${importSource}?target=es2020&bundle&deps-inline=true`;
+                downloadUrl = `https://esm.sh/${importSource}?target=es2020`;
             }
         }
 
-        // 1.5. Canonicalize
         const canonical = this.normalizeLibraryUrl(downloadUrl || importSource);
         if (canonical) {
             downloadUrl = canonical;
         }
 
-        // --- SPECIAL: Three.js Wrapper (Global Shim) ---
-        // Generates a wrapper file that exports Three modules AND sets window.THREE
-        if (downloadUrl && (downloadUrl.includes('/three@') || downloadUrl.includes('/three.js')) && !downloadUrl.includes('/addons/')) {
+        // --- Three.js Global Shim ---
+        if (downloadUrl && (downloadUrl.includes('/three') || downloadUrl.includes('three.module.js')) && !downloadUrl.includes('/addons/')) {
             const coreUrl = downloadUrl;
             const wrapperPath = './vendor/three.js';
             const wrapperKey = 'virtual:three-global-wrapper';
             
-            let coreImportPath;
+            if (this.downloads.has(wrapperKey)) return wrapperPath;
 
-            if (this.downloads.has(coreUrl)) {
-                 const existing = this.downloads.get(coreUrl).localPath;
-                 coreImportPath = existing.replace(/^\.\/vendor\//, './');
-            } else {
-                // Calculate name logic provided by user
-                let coreFilename = `vendor-${this.vendorCount}`;
-                try {
-                    const u = new URL(coreUrl);
-                    const pathParts = u.pathname.split('/');
-                    const filename = pathParts[pathParts.length - 1];
-                    if (filename && filename.length < 50) {
-                        const base = filename.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9.-]/g, '_');
-                        if (base) coreFilename = `${this.vendorCount}_${base}`;
-                    }
-                } catch(e) {}
-                
-                const corePath = `./vendor/${coreFilename}.js`;
-                coreImportPath = `./${coreFilename}.js`;
-                
-                this.downloads.set(coreUrl, {
-                    localPath: corePath,
-                    processPromise: this._fetchAndProcess(coreUrl)
-                });
-                this.vendorCount++;
-            }
+            let coreFilename = 'three-core.js';
+            const corePath = `./vendor/${coreFilename}`;
+            
+            this.downloads.set(coreUrl, {
+                localPath: corePath,
+                processPromise: this._fetchAndProcess(coreUrl, false) // Don't mangle huge three.js
+            });
 
-            // Ensure wrapper exists
-            if (!this.downloads.has(wrapperKey)) {
-                this.downloads.set(wrapperKey, {
-                    localPath: wrapperPath,
-                    processPromise: Promise.resolve(`
-import * as THREE_NS from '${coreImportPath}';
-
-// Create a mutable object for window.THREE to support legacy addons/scripts
-// that try to modify THREE (e.g. THREE.OrbitControls = ...)
+            this.downloads.set(wrapperKey, {
+                localPath: wrapperPath,
+                processPromise: Promise.resolve(`
+import * as THREE_NS from './three-core.js';
 const THREE = {};
-
 function copyProps(src) {
     if (!src) return;
-    const keys = Object.getOwnPropertyNames(src);
-    for (const key of keys) {
-        if (key === 'default' || key === '__esModule') continue;
-        try {
-            THREE[key] = src[key];
-        } catch(e) {}
-    }
+    Object.getOwnPropertyNames(src).forEach(key => {
+        if (key === 'default' || key === '__esModule') return;
+        try { THREE[key] = src[key]; } catch(e) {}
+    });
 }
-
-// 1. Copy named exports (standard ESM)
 copyProps(THREE_NS);
-
-// 2. If there's a default export that looks like the main library object, copy that too
-if (THREE_NS.default && typeof THREE_NS.default === 'object') {
-    copyProps(THREE_NS.default);
-}
-
+if (THREE_NS.default && typeof THREE_NS.default === 'object') copyProps(THREE_NS.default);
 if (typeof window !== 'undefined') {
     window.THREE = THREE;
     console.log('[WebSim] THREE.js Shim: Global window.THREE initialized.', { 
         rev: THREE.REVISION, 
         hasScene: !!THREE.Scene,
-        keys: Object.keys(THREE).length,
-        nsKeys: Object.keys(THREE_NS)
+        keys: Object.keys(THREE).length
     });
 }
-
 export default THREE;
-export * from '${coreImportPath}';
-`)
-                });
-            }
+export * from './three-core.js';`)
+            });
             return wrapperPath;
         }
 
-        // 2. Check Cache
         if (this.downloads.has(downloadUrl)) {
             return this.downloads.get(downloadUrl).localPath;
         }
 
-        // 3. Generate Local Path
         let safeName = `vendor-${this.vendorCount++}`;
         try {
             const u = new URL(downloadUrl);
@@ -175,8 +129,6 @@ export * from '${coreImportPath}';
         } catch(e) {}
         
         const localPath = `./vendor/${safeName}.js`;
-
-        // 4. Start Download
         this.downloads.set(downloadUrl, { 
             localPath, 
             processPromise: this._fetchAndProcess(downloadUrl) 
@@ -185,25 +137,27 @@ export * from '${coreImportPath}';
         return localPath;
     }
 
-    async _fetchAndProcess(url) {
+    async _fetchAndProcess(url, shouldRewrite = true) {
         try {
             const res = await fetch(url);
             if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
             let code = await res.text();
 
+            if (!shouldRewrite) return `// Source: ${url}\n${code}`;
+
             const rewritePath = (specifier) => {
-                 const resolvedLocal = this.resolve(specifier, url);
-                 // If resolved is absolute/remote, it might be an issue, but usually resolve handles it.
-                 // Ensure we keep relative paths clean
-                 if (!resolvedLocal.startsWith('.')) return resolvedLocal;
-                 
-                 const parts = resolvedLocal.split('/');
-                 return `./${parts[parts.length - 1]}`;
+                 // Prevent infinite loops/over-incrementing vendorCount during rewrite
+                 if (specifier.startsWith('http') || !specifier.match(/^\.?\.?\//)) {
+                    const resolvedLocal = this.resolve(specifier, url);
+                    const parts = resolvedLocal.split('/');
+                    return `./${parts[parts.length - 1]}`;
+                 }
+                 return specifier;
             };
 
             const regex = /(from\s*['"]|import\s*['"]|import\s*\(\s*['"])([^'"]+)(['"]\s*\)?)/g;
             code = code.replace(regex, (match, prefix, src, suffix) => {
-                if (src.startsWith('data:')) return match;
+                if (src.startsWith('data:') || src.startsWith('#')) return match;
                 return `${prefix}${rewritePath(src)}${suffix}`;
             });
 
@@ -329,14 +283,14 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
   }
 
   // Calculate relative path to root for vendor files
-  const depth = filePath.split('/').length - 1;
+  const depth = filePath.split('/').filter(p => p && p !== '.').length - 1;
   const toRoot = depth > 0 ? '../'.repeat(depth) : './';
 
   // 1. Inject Logger & Socket Polyfill
-  let polyfills = '<script src="logger.js"></script>\n    <script src="websim_socket.js"></script>';
+  let polyfills = `<script src="${toRoot}logger.js"></script>\n    <script src="${toRoot}websim_socket.js"></script>`;
   
   if (needsThree) {
-      const threePathRaw = depManager.resolve('three'); // e.g. ./vendor/three.js
+      const threePathRaw = depManager.resolve('three'); 
       const threePath = threePathRaw.replace(/^\.\//, toRoot);
       polyfills += `\n    <script src="${threePath}" type="module"></script>`;
   }
@@ -352,74 +306,61 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
   // 2. Handle Import Maps
   // Remove import maps to prevent CSP inline script violations.
   // We rewrite all imports in JS files (including extracted inline scripts) so the map is redundant.
-  html = html.replace(/<script\s+type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/gi, '<!-- Import Map Removed by Converter -->');
+  html = html.replace(/<script\s+type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/gi, '<!-- Import Map Removed -->');
 
   // 3. Process Scripts
+  const normalizePath = (p) => p.replace(/^(\.|\/)+/, '');
+
   html = html.replace(/<script([^>]*)>([\s\S]*?)<\/script>/gi, (match, attrs, content) => {
-    
-    // CASE A: External Script
     const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
     if (srcMatch) {
         let src = srcMatch[1];
-        
-        // Fix mjs extension
         if (src.endsWith('.mjs')) {
              src = src.replace(/\.mjs$/, '.js');
              attrs = attrs.replace(srcMatch[1], src);
         }
 
-        // If it's remote, we must download it!
         if (src.startsWith('http') || src.startsWith('//')) {
             if (src.startsWith('//')) src = 'https:' + src;
-            const localPath = depManager.resolve(src);
+            const localPathRaw = depManager.resolve(src);
+            const localPath = localPathRaw.replace(/^\.\//, toRoot);
             
             let newAttrs = attrs.replace(srcMatch[0], `src="${localPath}"`);
-            
-            // Force type="module" for downloaded dependencies (esm.sh) to ensure they load correctly
-            if (!newAttrs.includes('type="module"') && !newAttrs.includes("type='module'")) {
-                 newAttrs += ' type="module"';
-            }
-
-            return `<script ${newAttrs}>${content}</script>`;
+            if (!newAttrs.includes('type="module"')) newAttrs += ' type="module"';
+            return `<script ${newAttrs}></script>`;
         }
 
-        let filename = src;
-        // Clean path to match map keys
-        const cleanKey = filename.replace(/^(\.|\/)+/, '');
+        const dir = filePath.split('/').slice(0, -1).join('/');
+        const fullLocalPath = dir ? normalizePath(`${dir}/${src}`) : normalizePath(src);
         
-        if (knownModules.has(cleanKey)) {
-            if (!attrs.includes('type="module"') && !attrs.includes("type='module'")) {
-                return `<script type="module" ${attrs}>${content}</script>`;
+        let found = false;
+        for (const modPath of knownModules) {
+            if (normalizePath(modPath) === fullLocalPath) {
+                found = true;
+                break;
             }
+        }
+
+        if (found && !attrs.includes('type="module"')) {
+            return `<script type="module" ${attrs}></script>`;
         }
         return match;
     }
 
-    // CASE B: Inline Script
-    if (!content.trim()) return '';
-
-    // If it's a JSON script (importmap, ld+json), leave it alone
-    if (attrs.includes('type="application/json"') || attrs.includes('type="importmap"')) {
-        return match;
-    }
+    if (!content.trim() || attrs.includes('type="application/json"')) return match;
 
     scriptCounter++;
     const safeBase = baseFilename.replace(/[^\w-]/g, '_');
     const scriptFilename = `${safeBase}_inline_${scriptCounter}.js`;
     
-    let isModule = /\btype\s*=\s*["']module["']/i.test(attrs);
-    
     const processed = processJsForImports(content, depManager, filePath);
-    if (processed.isModule) isModule = true;
-    if (processed.usesGlobalThree) needsThree = true; // Flag current HTML as needing three if inline script uses it
+    let isModule = processed.isModule || /\btype\s*=\s*["']module["']/i.test(attrs);
+    if (processed.usesGlobalThree) needsThree = true;
 
     extractedScripts.push({ filename: scriptFilename, content: processed.content, usesGlobalThree: processed.usesGlobalThree });
 
     let newAttrs = attrs;
-    if (isModule && !newAttrs.toLowerCase().includes('type="module"')) {
-        newAttrs += ' type="module"';
-    }
-    
+    if (isModule && !newAttrs.toLowerCase().includes('type="module"')) newAttrs += ' type="module"';
     return `<script src="${scriptFilename}" ${newAttrs}></script>`;
   });
 

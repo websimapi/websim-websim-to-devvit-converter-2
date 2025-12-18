@@ -1,6 +1,7 @@
 import JSZip from 'jszip';
 import { 
     cleanName, 
+    sanitizeFilename,
     DependencyManager, 
     processJsForImports, 
     processHtmlForCSP 
@@ -83,16 +84,17 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
         if (path.includes('..')) continue;
 
         if (path.endsWith('.js') || path.endsWith('.mjs')) {
-            // Rename files with multiple dots (like my.game.js) to avoid MIME type confusion
-            // strictly keep extensions as .js
-            let safePath = path.replace(/\.mjs$/, '.js');
+            // Rename files with multiple dots (e.g. three.core.js) to avoid MIME type confusion
+            // AND enforce .js extension
+            const safePath = sanitizeFilename(path);
             
             const { content: processed, isModule, usesGlobalThree } = processJsForImports(content, depManager, path);
             if (usesGlobalThree) globalThreeDetected = true;
             
             processedFiles[safePath] = processed;
             
-            if (isModule) knownModules.add(path); // Track original path usage
+            // Add the safe path to known modules so we can resolve imports later
+            if (isModule) knownModules.add(safePath);
         } else if (!path.endsWith('.html')) {
             // Static assets
             processedFiles[path] = content;
@@ -104,7 +106,9 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
         if (path.includes('..')) continue;
 
         if (path.endsWith('.html')) {
-            const { html, extractedScripts } = processHtmlForCSP(content, path, depManager, knownModules, globalThreeDetected);
+            // Pass keys of processedFiles as knownPaths to ensure we match against renamed assets
+            const knownPaths = new Set(Object.keys(processedFiles));
+            const { html, extractedScripts } = processHtmlForCSP(content, path, depManager, knownPaths, globalThreeDetected);
             processedFiles[path] = html;
             
             // Handle extracted inline scripts

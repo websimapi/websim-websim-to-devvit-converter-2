@@ -3,6 +3,30 @@
 // Helper to sanitize filenames
 export const cleanName = (name) => name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
 
+// Sanitize a file path to prevent MIME type issues (e.g. .core.js -> _core.js)
+export function sanitizeFilename(filePath) {
+    const parts = filePath.split('/');
+    let filename = parts.pop();
+    
+    // Normalize extension
+    let ext = '';
+    if (filename.endsWith('.mjs')) {
+        ext = '.js';
+        filename = filename.slice(0, -4);
+    } else if (filename.endsWith('.js')) {
+        ext = '.js';
+        filename = filename.slice(0, -3);
+    } else {
+        // preserve other extensions (css, html) or no extension
+        return filePath;
+    }
+
+    // Replace dots in base name with underscores to avoid "text/plain" MIME type issues
+    filename = filename.replace(/\./g, '_');
+    
+    return [...parts, filename + ext].join('/');
+}
+
 export function uint8ToString(u8) {
   if (typeof u8 === 'string') return u8;
   if (!(u8 instanceof Uint8Array)) return String(u8 ?? '');
@@ -249,8 +273,9 @@ export function processJsForImports(jsContent, depManager, filePath) {
   // Fix Common Legacy Import Issues
 
   // Heuristic: If script uses global THREE, treat it as a module so it waits for vendor injection
-  // Exclude actual Three.js library files from this heuristic to prevent breaking UMD definitions
-  const isLib = /(^|\/)three(\.min)?\.js$/i.test(filePath) || /(^|\/)three-core\.js$/i.test(filePath);
+  // Exclude actual Three.js library files to prevent breaking UMD definitions
+  // We check for various forms of 'three' filenames after sanitization
+  const isLib = /(^|\/)three(_min)?\.js$/i.test(filePath) || /(^|\/)three(_core)?\.js$/i.test(filePath) || filePath.includes('vendor/');
   
   if (!isLib) {
       // Check for global usage pattern (and not just inside an import statement)
@@ -266,16 +291,32 @@ export function processJsForImports(jsContent, depManager, filePath) {
   // 3. import("...")
   
   const replaceCallback = (match, prefix, source, suffix) => {
-      // If it looks like a remote URL or bare import, resolve it
+      // 1. Remote / Bare Imports
       if (source.startsWith('http') || !source.match(/^\.?\.?\//)) {
           const rootLocalPath = depManager.resolve(source);
           const relativePath = computeRelativePath(filePath, rootLocalPath);
           return `${prefix}${relativePath}${suffix}`;
       }
-      // Fix local .mjs imports
-      if (source.endsWith('.mjs')) {
-          return `${prefix}${source.replace(/\.mjs$/, '.js')}${suffix}`;
+      
+      // 2. Local Imports - Sanitize Filenames
+      // If the source looks like a JS file, apply the same sanitization we apply to the file assets
+      if (source.endsWith('.js') || source.endsWith('.mjs')) {
+          const parts = source.split('/');
+          let filename = parts.pop();
+          
+          let ext = '.js'; 
+          let nameBase = filename;
+          
+          if (nameBase.endsWith('.mjs')) nameBase = nameBase.slice(0, -4);
+          else if (nameBase.endsWith('.js')) nameBase = nameBase.slice(0, -3);
+          
+          // Apply substitution: dots -> underscores
+          nameBase = nameBase.replace(/\./g, '_');
+          
+          const newSource = [...parts, nameBase + ext].join('/');
+          return `${prefix}${newSource}${suffix}`;
       }
+      
       return match;
   };
 
@@ -342,9 +383,27 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
     const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
     if (srcMatch) {
         let src = srcMatch[1];
-        if (src.endsWith('.mjs')) {
-             src = src.replace(/\.mjs$/, '.js');
-             attrs = attrs.replace(srcMatch[1], src);
+        // Sanitize local src paths in HTML to match file system sanitization
+        if (!src.startsWith('http') && !src.startsWith('//')) {
+            const parts = src.split('/');
+            let filename = parts.pop();
+            let newFilename = filename;
+            
+            // Mirror logic from sanitizeFilename
+            if (filename.endsWith('.mjs')) {
+                newFilename = filename.replace(/\.mjs$/, '.js');
+                const base = newFilename.slice(0, -3).replace(/\./g, '_');
+                newFilename = base + '.js';
+            } else if (filename.endsWith('.js')) {
+                const base = filename.slice(0, -3).replace(/\./g, '_');
+                newFilename = base + '.js';
+            }
+            
+            if (newFilename !== filename) {
+                const newSrc = [...parts, newFilename].join('/');
+                attrs = attrs.replace(srcMatch[1], newSrc);
+                src = newSrc;
+            }
         }
 
         if (src.startsWith('http') || src.startsWith('//')) {

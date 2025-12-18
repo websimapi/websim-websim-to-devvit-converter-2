@@ -1,7 +1,6 @@
 import JSZip from 'jszip';
 import { 
     cleanName, 
-    sanitizeFilename,
     DependencyManager, 
     processJsForImports, 
     processHtmlForCSP 
@@ -78,23 +77,13 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
     const knownModules = new Set();
     
     // Pass 1: JS Files - Identify Modules & Rewrite Imports
-    let globalThreeDetected = false;
-
     for (const [path, content] of Object.entries(assets)) {
         if (path.includes('..')) continue;
 
         if (path.endsWith('.js') || path.endsWith('.mjs')) {
-            // Rename files with multiple dots (e.g. three.core.js) to avoid MIME type confusion
-            // AND enforce .js extension
-            const safePath = sanitizeFilename(path);
-            
-            const { content: processed, isModule, usesGlobalThree } = processJsForImports(content, depManager, path);
-            if (usesGlobalThree) globalThreeDetected = true;
-            
-            processedFiles[safePath] = processed;
-            
-            // Add the safe path to known modules so we can resolve imports later
-            if (isModule) knownModules.add(safePath);
+            const { content: processed, isModule } = processJsForImports(content, depManager);
+            processedFiles[path] = processed;
+            if (isModule) knownModules.add(path);
         } else if (!path.endsWith('.html')) {
             // Static assets
             processedFiles[path] = content;
@@ -106,14 +95,11 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
         if (path.includes('..')) continue;
 
         if (path.endsWith('.html')) {
-            // Pass keys of processedFiles as knownPaths to ensure we match against renamed assets
-            const knownPaths = new Set(Object.keys(processedFiles));
-            const { html, extractedScripts } = processHtmlForCSP(content, path, depManager, knownPaths, globalThreeDetected);
+            const { html, extractedScripts } = processHtmlForCSP(content, path.split('/').pop(), depManager, knownModules);
             processedFiles[path] = html;
             
             // Handle extracted inline scripts
             extractedScripts.forEach(s => {
-                if (s.usesGlobalThree) globalThreeDetected = true;
                 const parts = path.split('/');
                 parts.pop();
                 const dir = parts.join('/');
@@ -132,9 +118,7 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
 
     // Write all processed files to zip
     for (const [path, content] of Object.entries(processedFiles)) {
-        // Ensure strictly relative paths
-        const cleanPath = path.replace(/^\/+/, '');
-        webRoot.file(cleanPath, content);
+        webRoot.file(path, content);
     }
 
     // Add Logger & Socket Polyfill

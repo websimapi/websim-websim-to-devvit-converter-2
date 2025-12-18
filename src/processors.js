@@ -138,8 +138,21 @@ export class DependencyManager {
     }
 }
 
+function computeRelativePath(fromFile, toRootPath) {
+    // toRootPath is like "./vendor/file.js"
+    const targetPath = toRootPath.replace(/^\.\//, ''); // "vendor/file.js"
+    
+    const fromParts = fromFile.split('/');
+    fromParts.pop(); // remove filename, get dir parts
+    
+    if (fromParts.length === 0) return `./${targetPath}`;
+    
+    const up = fromParts.map(() => '..').join('/');
+    return `${up}/${targetPath}`;
+}
+
 // Parse JS files to detect imports, download them, and rewrite paths
-export function processJsForImports(jsContent, depManager) {
+export function processJsForImports(jsContent, depManager, filePath) {
   let js = uint8ToString(jsContent);
   let isModule = false;
 
@@ -156,8 +169,13 @@ export function processJsForImports(jsContent, depManager) {
   const replaceCallback = (match, prefix, source, suffix) => {
       // If it looks like a remote URL or bare import, resolve it
       if (source.startsWith('http') || !source.match(/^\.?\.?\//)) {
-          const localPath = depManager.resolve(source);
-          return `${prefix}${localPath}${suffix}`;
+          const rootLocalPath = depManager.resolve(source);
+          const relativePath = computeRelativePath(filePath, rootLocalPath);
+          return `${prefix}${relativePath}${suffix}`;
+      }
+      // Fix local .mjs imports
+      if (source.endsWith('.mjs')) {
+          return `${prefix}${source.replace(/\.mjs$/, '.js')}${suffix}`;
       }
       return match;
   };
@@ -175,8 +193,9 @@ export function processJsForImports(jsContent, depManager) {
 }
 
 // Parse HTML to extract scripts and handle import maps
-export function processHtmlForCSP(htmlContent, baseFilename, depManager, knownModules = new Set()) {
+export function processHtmlForCSP(htmlContent, filePath, depManager, knownModules = new Set()) {
   let html = uint8ToString(htmlContent);
+  const baseFilename = filePath.split('/').pop();
   const extractedScripts = [];
   let scriptCounter = 0;
 
@@ -208,6 +227,12 @@ export function processHtmlForCSP(htmlContent, baseFilename, depManager, knownMo
     if (srcMatch) {
         let src = srcMatch[1];
         
+        // Fix mjs extension
+        if (src.endsWith('.mjs')) {
+             src = src.replace(/\.mjs$/, '.js');
+             attrs = attrs.replace(srcMatch[1], src);
+        }
+
         // If it's remote, we must download it!
         if (src.startsWith('http') || src.startsWith('//')) {
             if (src.startsWith('//')) src = 'https:' + src;
@@ -243,7 +268,7 @@ export function processHtmlForCSP(htmlContent, baseFilename, depManager, knownMo
     
     let isModule = /\btype\s*=\s*["']module["']/i.test(attrs);
     
-    const processed = processJsForImports(content, depManager);
+    const processed = processJsForImports(content, depManager, filePath);
     if (processed.isModule) isModule = true;
 
     extractedScripts.push({ filename: scriptFilename, content: processed.content });

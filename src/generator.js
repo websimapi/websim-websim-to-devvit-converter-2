@@ -81,8 +81,12 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
         if (path.includes('..')) continue;
 
         if (path.endsWith('.js') || path.endsWith('.mjs')) {
-            const { content: processed, isModule } = processJsForImports(content, depManager);
-            processedFiles[path] = processed;
+            const { content: processed, isModule } = processJsForImports(content, depManager, path);
+            
+            // Convert .mjs to .js for Devvit compatibility
+            const outPath = path.replace(/\.mjs$/, '.js');
+            processedFiles[outPath] = processed;
+            
             if (isModule) knownModules.add(path);
         } else if (!path.endsWith('.html')) {
             // Static assets
@@ -95,7 +99,7 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
         if (path.includes('..')) continue;
 
         if (path.endsWith('.html')) {
-            const { html, extractedScripts } = processHtmlForCSP(content, path.split('/').pop(), depManager, knownModules);
+            const { html, extractedScripts } = processHtmlForCSP(content, path, depManager, knownModules);
             processedFiles[path] = html;
             
             // Handle extracted inline scripts

@@ -96,10 +96,24 @@ export class DependencyManager {
                     localPath: wrapperPath,
                     processPromise: Promise.resolve(`
 import * as THREE_NS from './three-core.js';
-const THREE = (THREE_NS && THREE_NS.default) ? THREE_NS.default : THREE_NS;
+
+// Create a mutable object for window.THREE to support legacy addons/scripts
+// that try to modify THREE (e.g. THREE.OrbitControls = ...)
+const THREE = {};
+const src = (THREE_NS && THREE_NS.default && typeof THREE_NS.default === 'object' && 'Scene' in THREE_NS.default) 
+    ? THREE_NS.default 
+    : THREE_NS;
+
+// Flatten properties
+for (const key in src) {
+    THREE[key] = src[key];
+}
+
 if (typeof window !== 'undefined') {
     window.THREE = THREE;
+    console.log('[WebSim] THREE.js Shim: Global window.THREE initialized.', { rev: THREE.REVISION });
 }
+
 export default THREE;
 export * from './three-core.js';
 `)
@@ -218,7 +232,10 @@ export function processJsForImports(jsContent, depManager, filePath) {
   // Fix Common Legacy Import Issues
 
   // Heuristic: If script uses global THREE, treat it as a module so it waits for vendor injection
-  if (js.includes('THREE.') || js.includes('new THREE')) {
+  // Exclude actual Three.js library files from this heuristic to prevent breaking UMD definitions
+  const isLib = /(^|\/)three(\.min)?\.js$/i.test(filePath) || /(^|\/)three-core\.js$/i.test(filePath);
+  
+  if (!isLib && (js.includes('THREE.') || js.includes('new THREE'))) {
       isModule = true;
   }
 

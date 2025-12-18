@@ -83,14 +83,16 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
         if (path.includes('..')) continue;
 
         if (path.endsWith('.js') || path.endsWith('.mjs')) {
+            // Rename files with multiple dots (like my.game.js) to avoid MIME type confusion
+            // strictly keep extensions as .js
+            let safePath = path.replace(/\.mjs$/, '.js');
+            
             const { content: processed, isModule, usesGlobalThree } = processJsForImports(content, depManager, path);
             if (usesGlobalThree) globalThreeDetected = true;
             
-            // Convert .mjs to .js for Devvit compatibility
-            const outPath = path.replace(/\.mjs$/, '.js');
-            processedFiles[outPath] = processed;
+            processedFiles[safePath] = processed;
             
-            if (isModule) knownModules.add(path);
+            if (isModule) knownModules.add(path); // Track original path usage
         } else if (!path.endsWith('.html')) {
             // Static assets
             processedFiles[path] = content;
@@ -126,7 +128,9 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
 
     // Write all processed files to zip
     for (const [path, content] of Object.entries(processedFiles)) {
-        webRoot.file(path, content);
+        // Ensure strictly relative paths
+        const cleanPath = path.replace(/^\/+/, '');
+        webRoot.file(cleanPath, content);
     }
 
     // Add Logger & Socket Polyfill

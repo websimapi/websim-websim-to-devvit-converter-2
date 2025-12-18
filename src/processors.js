@@ -22,7 +22,8 @@ export class DependencyManager {
         const cleanUrl = url.split('?')[0];
         const lower = cleanUrl.toLowerCase();
         
-        // Use reliable ESM builds from unpkg for core libs to avoid complex dependency trees
+        // Use reliable ESM builds from jsdelivr for core libs.
+        // jsdelivr is more consistent with Content-Type and availability than unpkg for some environments.
         if (lower.endsWith('/three') || 
             lower.endsWith('/three.js') || 
             lower.endsWith('/three.module.js') ||
@@ -34,16 +35,16 @@ export class DependencyManager {
                  !lower.includes('three-') &&
                  !lower.includes('stdlib')) {
 
-                 // Extract version if available to match requested version (e.g. from esm.sh redirect)
-                 // Default to a recent version (0.172.0) that includes 'Controls' for compatibility with newer addons
+                 // Extract version if available
                  const versionMatch = lower.match(/three@([\d\.]+)/);
                  const version = versionMatch ? versionMatch[1] : '0.172.0';
-                 return `https://unpkg.com/three@${version}/build/three.module.js`;
+                 // Using jsdelivr for robust cdn
+                 return `https://cdn.jsdelivr.net/npm/three@${version}/build/three.module.js`;
              }
         }
         
         if (lower.includes('tween.js') || lower === '@tweenjs/tween.js') {
-            return 'https://unpkg.com/@tweenjs/tween.js@23.1.1/dist/tween.esm.js';
+            return 'https://cdn.jsdelivr.net/npm/@tweenjs/tween.js@23.1.1/dist/tween.esm.js';
         }
         
         return null;
@@ -52,6 +53,7 @@ export class DependencyManager {
     resolve(importSource, referrerUrl = null) {
         let downloadUrl;
         
+        // 1. Resolve full URL
         if (referrerUrl) {
             try {
                 if (importSource.startsWith('.')) {
@@ -84,35 +86,44 @@ export class DependencyManager {
         }
 
         // --- Three.js Global Shim ---
+        // We intercept ANY attempt to load three.js core and force our shim pattern.
         if (downloadUrl && (downloadUrl.includes('/three') || downloadUrl.includes('three.module.js')) && !downloadUrl.includes('/addons/')) {
             const coreUrl = downloadUrl;
             const wrapperPath = './vendor/three.js';
             const wrapperKey = 'virtual:three-global-wrapper';
             
-            if (this.downloads.has(wrapperKey)) return wrapperPath;
-
-            let coreFilename = 'three-core.js';
+            // Note: We use underscore 'three_core.js' to minimize MIME confusion with double dots in some server envs
+            const coreFilename = 'three_core.js';
             const corePath = `./vendor/${coreFilename}`;
-            
-            this.downloads.set(coreUrl, {
-                localPath: corePath,
-                processPromise: this._fetchAndProcess(coreUrl, false) // Don't mangle huge three.js
-            });
 
-            this.downloads.set(wrapperKey, {
-                localPath: wrapperPath,
-                processPromise: Promise.resolve(`
-import * as THREE_NS from './three-core.js';
+            // Ensure we register the core download, even if wrapper exists (idempotent)
+            if (!this.downloads.has(coreUrl)) {
+                 this.downloads.set(coreUrl, {
+                    localPath: corePath,
+                    processPromise: this._fetchAndProcess(coreUrl, false) // Don't mangle huge three.js
+                });
+            }
+
+            if (!this.downloads.has(wrapperKey)) {
+                this.downloads.set(wrapperKey, {
+                    localPath: wrapperPath,
+                    processPromise: Promise.resolve(`
+import * as THREE_NS from './${coreFilename}';
 const THREE = {};
-function copyProps(src) {
+// Robust property copy
+const copy = (src) => {
     if (!src) return;
-    Object.getOwnPropertyNames(src).forEach(key => {
-        if (key === 'default' || key === '__esModule') return;
-        try { THREE[key] = src[key]; } catch(e) {}
-    });
-}
-copyProps(THREE_NS);
-if (THREE_NS.default && typeof THREE_NS.default === 'object') copyProps(THREE_NS.default);
+    for (const key of Object.getOwnPropertyNames(src)) {
+        if (key === 'default' || key === '__esModule') continue;
+        try { 
+            Object.defineProperty(THREE, key, Object.getOwnPropertyDescriptor(src, key));
+        } catch(e) { THREE[key] = src[key]; }
+    }
+};
+copy(THREE_NS);
+// Also copy default export if it's the namespace itself (common in some bundlers)
+if (THREE_NS.default && typeof THREE_NS.default === 'object') copy(THREE_NS.default);
+
 if (typeof window !== 'undefined') {
     window.THREE = THREE;
     console.log('[WebSim] THREE.js Shim: Global window.THREE initialized.', { 
@@ -122,8 +133,10 @@ if (typeof window !== 'undefined') {
     });
 }
 export default THREE;
-export * from './three-core.js';`)
-            });
+export * from './${coreFilename}';
+`)
+                });
+            }
             return wrapperPath;
         }
 
@@ -131,17 +144,23 @@ export * from './three-core.js';`)
             return this.downloads.get(downloadUrl).localPath;
         }
 
+        // Generic Vendor File Handling
         let safeName = `vendor-${this.vendorCount++}`;
         try {
             const u = new URL(downloadUrl);
             const pathParts = u.pathname.split('/');
-            const filename = pathParts[pathParts.length - 1];
+            let filename = pathParts[pathParts.length - 1];
+            // Remove version strings from filenames to keep them clean
+            filename = filename.replace(/@[\d\.]+/, '');
+            
             if (filename && filename.length < 50) {
-                 const base = filename.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9.-]/g, '_');
+                 // Replace all dots with underscores except the last one to avoid 'file.core.js' issues if platform is strict
+                 const base = filename.replace(/\.[^.]+$/, '').replace(/[\.]/g, '_').replace(/[^a-zA-Z0-9_-]/g, '_');
                  if (base) safeName = `${this.vendorCount}_${base}`;
             }
         } catch(e) {}
         
+        // Force .js extension
         const localPath = `./vendor/${safeName}.js`;
         this.downloads.set(downloadUrl, { 
             localPath, 
@@ -154,8 +173,15 @@ export * from './three-core.js';`)
     async _fetchAndProcess(url, shouldRewrite = true) {
         try {
             const res = await fetch(url);
-            if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+            if (!res.ok) throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);
+            
+            const contentType = res.headers.get('content-type');
             let code = await res.text();
+
+            // Safety check for HTML error pages masquerading as JS
+            if (code.trim().startsWith('<!DOCTYPE') || code.trim().startsWith('<html')) {
+                throw new Error('Received HTML instead of JS');
+            }
 
             if (!shouldRewrite) return `// Source: ${url}\n${code}`;
 
@@ -188,6 +214,7 @@ export * from './three-core.js';`)
         const files = {};
         const processed = new Set();
         
+        // Iterative processing to catch nested dependencies discovered during rewrite
         while(true) {
             const urls = Array.from(this.downloads.keys());
             let hasNew = false;
@@ -198,12 +225,20 @@ export * from './three-core.js';`)
                 processed.add(url);
                 
                 const entry = this.downloads.get(url);
-                let content = await entry.processPromise;
-                
-                content = content.replace(/from\s*['"]([^'"]+)\.mjs['"]/g, "from '$1.js'");
-                
-                const zipPath = entry.localPath.replace(/^\.\//, '');
-                files[zipPath] = content;
+                try {
+                    let content = await entry.processPromise;
+                    
+                    // Final cleanup of imports
+                    content = content.replace(/from\s*['"]([^'"]+)\.mjs['"]/g, "from '$1.js'");
+                    
+                    const zipPath = entry.localPath.replace(/^\.\//, '');
+                    files[zipPath] = content;
+                } catch (e) {
+                    console.error(`Failed to process vendor file ${url}:`, e);
+                    // Create a valid JS file that logs the error, to prevent browser "SyntaxError" or "MIME" issues on 404s
+                    const zipPath = entry.localPath.replace(/^\.\//, '');
+                    files[zipPath] = `console.error("Failed to load dependency: ${url} - ${e.message}");`;
+                }
             }
             if(!hasNew) break;
         }

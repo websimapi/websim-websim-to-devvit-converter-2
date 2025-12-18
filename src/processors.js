@@ -33,7 +33,12 @@ export class DependencyManager {
                  !lower.includes('/examples/') && 
                  !lower.includes('three-') &&
                  !lower.includes('stdlib')) {
-                 return 'https://unpkg.com/three@0.160.0/build/three.module.js';
+
+                 // Extract version if available to match requested version (e.g. from esm.sh redirect)
+                 // Default to a recent version (0.172.0) that includes 'Controls' for compatibility with newer addons
+                 const versionMatch = lower.match(/three@([\d\.]+)/);
+                 const version = versionMatch ? versionMatch[1] : '0.172.0';
+                 return `https://unpkg.com/three@${version}/build/three.module.js`;
              }
         }
         

@@ -19,11 +19,20 @@ export class DependencyManager {
 
     normalizeLibraryUrl(url) {
         if (!url) return null;
-        const lower = url.toLowerCase();
+        const cleanUrl = url.split('?')[0];
+        const lower = cleanUrl.toLowerCase();
         
-        // Use reliable ESM builds from unpkg/esm.sh for core libs
-        if (lower.includes('/three@') || lower.endsWith('/three') || lower.endsWith('/three.js') || lower === 'three') {
-             if (!lower.includes('/addons/') && !lower.includes('/examples/') && !lower.includes('three-')) {
+        // Use reliable ESM builds from unpkg for core libs to avoid complex dependency trees
+        if (lower.endsWith('/three') || 
+            lower.endsWith('/three.js') || 
+            lower.endsWith('/three.module.js') ||
+            lower.includes('/three@') ||
+            cleanUrl === 'three') {
+            
+             if (!lower.includes('/addons/') && 
+                 !lower.includes('/examples/') && 
+                 !lower.includes('three-') &&
+                 !lower.includes('stdlib')) {
                  return 'https://unpkg.com/three@0.160.0/build/three.module.js';
              }
         }
@@ -146,13 +155,15 @@ export * from './three-core.js';`)
             if (!shouldRewrite) return `// Source: ${url}\n${code}`;
 
             const rewritePath = (specifier) => {
-                 // Prevent infinite loops/over-incrementing vendorCount during rewrite
-                 if (specifier.startsWith('http') || !specifier.match(/^\.?\.?\//)) {
-                    const resolvedLocal = this.resolve(specifier, url);
-                    const parts = resolvedLocal.split('/');
-                    return `./${parts[parts.length - 1]}`;
+                 if (specifier.startsWith('data:') || specifier.startsWith('#')) return specifier;
+
+                 try {
+                     const resolvedLocal = this.resolve(specifier, url);
+                     const parts = resolvedLocal.split('/');
+                     return `./${parts[parts.length - 1]}`;
+                 } catch(e) {
+                     return specifier;
                  }
-                 return specifier;
             };
 
             const regex = /(from\s*['"]|import\s*['"]|import\s*\(\s*['"])([^'"]+)(['"]\s*\)?)/g;

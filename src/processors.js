@@ -78,16 +78,35 @@ export class DependencyManager {
         // Generates a wrapper file that exports Three modules AND sets window.THREE
         if (downloadUrl && (downloadUrl.includes('/three@') || downloadUrl.includes('/three.js')) && !downloadUrl.includes('/addons/')) {
             const coreUrl = downloadUrl;
-            const corePath = './vendor/three-core.js';
             const wrapperPath = './vendor/three.js';
             const wrapperKey = 'virtual:three-global-wrapper';
+            
+            let coreImportPath;
 
-            // Ensure core is downloaded
-            if (!this.downloads.has(coreUrl)) {
+            if (this.downloads.has(coreUrl)) {
+                 const existing = this.downloads.get(coreUrl).localPath;
+                 coreImportPath = existing.replace(/^\.\/vendor\//, './');
+            } else {
+                // Calculate name logic provided by user
+                let coreFilename = `vendor-${this.vendorCount}`;
+                try {
+                    const u = new URL(coreUrl);
+                    const pathParts = u.pathname.split('/');
+                    const filename = pathParts[pathParts.length - 1];
+                    if (filename && filename.length < 50) {
+                        const base = filename.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9.-]/g, '_');
+                        if (base) coreFilename = `${this.vendorCount}_${base}`;
+                    }
+                } catch(e) {}
+                
+                const corePath = `./vendor/${coreFilename}.js`;
+                coreImportPath = `./${coreFilename}.js`;
+                
                 this.downloads.set(coreUrl, {
                     localPath: corePath,
                     processPromise: this._fetchAndProcess(coreUrl)
                 });
+                this.vendorCount++;
             }
 
             // Ensure wrapper exists
@@ -95,7 +114,7 @@ export class DependencyManager {
                 this.downloads.set(wrapperKey, {
                     localPath: wrapperPath,
                     processPromise: Promise.resolve(`
-import * as THREE_NS from './three-core.js';
+import * as THREE_NS from '${coreImportPath}';
 
 // Create a mutable object for window.THREE to support legacy addons/scripts
 // that try to modify THREE (e.g. THREE.OrbitControls = ...)
@@ -134,7 +153,7 @@ if (typeof window !== 'undefined') {
 }
 
 export default THREE;
-export * from './three-core.js';
+export * from '${coreImportPath}';
 `)
                 });
             }

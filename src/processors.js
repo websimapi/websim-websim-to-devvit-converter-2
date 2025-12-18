@@ -100,18 +100,37 @@ import * as THREE_NS from './three-core.js';
 // Create a mutable object for window.THREE to support legacy addons/scripts
 // that try to modify THREE (e.g. THREE.OrbitControls = ...)
 const THREE = {};
-const src = (THREE_NS && THREE_NS.default && typeof THREE_NS.default === 'object' && 'Scene' in THREE_NS.default) 
-    ? THREE_NS.default 
-    : THREE_NS;
 
-// Flatten properties
-for (const key in src) {
-    THREE[key] = src[key];
+function copyProps(src) {
+    if (!src) return;
+    // Use getOwnPropertyNames to handle module namespace objects correctly
+    const keys = Object.getOwnPropertyNames(src);
+    for (const key of keys) {
+        if (key === 'default') continue;
+        try {
+            THREE[key] = src[key];
+        } catch(e) {}
+    }
 }
+
+// 1. Copy named exports (standard ESM)
+copyProps(THREE_NS);
+
+// 2. If there's a default export that looks like the main library object, copy that too
+if (THREE_NS.default && typeof THREE_NS.default === 'object') {
+    copyProps(THREE_NS.default);
+}
+
+// 3. Fallback for Scene if missing
+if (!THREE.Scene && THREE_NS.Scene) THREE.Scene = THREE_NS.Scene;
 
 if (typeof window !== 'undefined') {
     window.THREE = THREE;
-    console.log('[WebSim] THREE.js Shim: Global window.THREE initialized.', { rev: THREE.REVISION });
+    console.log('[WebSim] THREE.js Shim: Global window.THREE initialized.', { 
+        rev: THREE.REVISION, 
+        hasScene: !!THREE.Scene,
+        keys: Object.keys(THREE).length 
+    });
 }
 
 export default THREE;
@@ -223,6 +242,7 @@ function computeRelativePath(fromFile, toRootPath) {
 export function processJsForImports(jsContent, depManager, filePath) {
   let js = uint8ToString(jsContent);
   let isModule = false;
+  let usesGlobalThree = false;
 
   // Basic check for module syntax
   if (/^\s*(import|export)\s/m.test(js) || /import\s*\(/.test(js)) {
@@ -235,8 +255,12 @@ export function processJsForImports(jsContent, depManager, filePath) {
   // Exclude actual Three.js library files from this heuristic to prevent breaking UMD definitions
   const isLib = /(^|\/)three(\.min)?\.js$/i.test(filePath) || /(^|\/)three-core\.js$/i.test(filePath);
   
-  if (!isLib && (js.includes('THREE.') || js.includes('new THREE'))) {
-      isModule = true;
+  if (!isLib) {
+      // Check for global usage pattern (and not just inside an import statement)
+      if ((js.includes('THREE.') || js.includes('new THREE')) && !js.includes('import * as THREE')) {
+          usesGlobalThree = true;
+          isModule = true; // Force module to ensure defer loading if possible
+      }
   }
 
   // Regex to match imports:
@@ -267,11 +291,11 @@ export function processJsForImports(jsContent, depManager, filePath) {
   // Replace dynamic import('...')
   js = js.replace(/(import\s*\(\s*['"])([^'"]+)(['"]\s*\))/g, replaceCallback);
 
-  return { content: js, isModule };
+  return { content: js, isModule, usesGlobalThree };
 }
 
 // Parse HTML to extract scripts and handle import maps
-export function processHtmlForCSP(htmlContent, filePath, depManager, knownModules = new Set()) {
+export function processHtmlForCSP(htmlContent, filePath, depManager, knownModules = new Set(), forceThree = false) {
   let html = uint8ToString(htmlContent);
   const baseFilename = filePath.split('/').pop();
   const extractedScripts = [];
@@ -281,9 +305,26 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
   if (!html.trim().toLowerCase().startsWith('<!doctype')) {
     html = '<!DOCTYPE html>\n' + html;
   }
+  
+  // Detect if THREE is used in the HTML itself
+  let needsThree = forceThree;
+  if (!needsThree && (html.includes('THREE.') || html.includes('new THREE'))) {
+      needsThree = true;
+  }
+
+  // Calculate relative path to root for vendor files
+  const depth = filePath.split('/').length - 1;
+  const toRoot = depth > 0 ? '../'.repeat(depth) : './';
 
   // 1. Inject Logger & Socket Polyfill
-  const polyfills = '<script src="logger.js"></script>\n    <script src="websim_socket.js"></script>';
+  let polyfills = '<script src="logger.js"></script>\n    <script src="websim_socket.js"></script>';
+  
+  if (needsThree) {
+      const threePathRaw = depManager.resolve('three'); // e.g. ./vendor/three.js
+      const threePath = threePathRaw.replace(/^\.\//, toRoot);
+      polyfills += `\n    <script src="${threePath}" type="module"></script>`;
+  }
+
   if (html.includes('<head>')) {
     html = html.replace('<head>', '<head>\n    ' + polyfills);
   } else if (html.includes('<body>')) {
@@ -354,8 +395,9 @@ export function processHtmlForCSP(htmlContent, filePath, depManager, knownModule
     
     const processed = processJsForImports(content, depManager, filePath);
     if (processed.isModule) isModule = true;
+    if (processed.usesGlobalThree) needsThree = true; // Flag current HTML as needing three if inline script uses it
 
-    extractedScripts.push({ filename: scriptFilename, content: processed.content });
+    extractedScripts.push({ filename: scriptFilename, content: processed.content, usesGlobalThree: processed.usesGlobalThree });
 
     let newAttrs = attrs;
     if (isModule && !newAttrs.toLowerCase().includes('type="module"')) {

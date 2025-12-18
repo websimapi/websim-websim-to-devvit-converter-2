@@ -77,11 +77,14 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
     const knownModules = new Set();
     
     // Pass 1: JS Files - Identify Modules & Rewrite Imports
+    let globalThreeDetected = false;
+
     for (const [path, content] of Object.entries(assets)) {
         if (path.includes('..')) continue;
 
         if (path.endsWith('.js') || path.endsWith('.mjs')) {
-            const { content: processed, isModule } = processJsForImports(content, depManager, path);
+            const { content: processed, isModule, usesGlobalThree } = processJsForImports(content, depManager, path);
+            if (usesGlobalThree) globalThreeDetected = true;
             
             // Convert .mjs to .js for Devvit compatibility
             const outPath = path.replace(/\.mjs$/, '.js');
@@ -99,11 +102,12 @@ export async function generateDevvitZip(projectMeta, assets, includeReadme = tru
         if (path.includes('..')) continue;
 
         if (path.endsWith('.html')) {
-            const { html, extractedScripts } = processHtmlForCSP(content, path, depManager, knownModules);
+            const { html, extractedScripts } = processHtmlForCSP(content, path, depManager, knownModules, globalThreeDetected);
             processedFiles[path] = html;
             
             // Handle extracted inline scripts
             extractedScripts.forEach(s => {
+                if (s.usesGlobalThree) globalThreeDetected = true;
                 const parts = path.split('/');
                 parts.pop();
                 const dir = parts.join('/');

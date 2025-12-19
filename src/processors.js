@@ -2,9 +2,7 @@ import * as acorn from 'https://esm.sh/acorn@8.11.3';
 import { simple as walkSimple } from 'https://esm.sh/acorn-walk@8.3.2';
 import MagicString from 'https://esm.sh/magic-string@0.30.5';
 
-// Processing Logic (Dependencies, Imports, HTML Parsing)
-
-// Helper to sanitize filenames
+// Helper: Clean Filename
 export const cleanName = (name) => name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
 
 export function uint8ToString(u8) {
@@ -13,322 +11,178 @@ export function uint8ToString(u8) {
   return new TextDecoder().decode(u8);
 }
 
-// --- Dependency Management ---
+// --- Asset Analyzer & Rewriter (Vite Logic) ---
 
-export class DependencyManager {
+export class AssetAnalyzer {
     constructor() {
-        this.downloads = new Map(); // url -> { localPath, processPromise }
-        this.vendorCount = 0;
+        this.dependencies = {};
     }
 
-    // Resolves an import. 
-    // referrerUrl is the absolute URL of the file importing this, or null if it's the root project.
-    resolve(importSource, referrerUrl = null) {
-        // 1. Determine URL
-        let downloadUrl;
-        
-        if (referrerUrl) {
-            // Relative to referrer (inside a vendor file)
-            try {
-                if (importSource.startsWith('.')) {
-                    downloadUrl = new URL(importSource, referrerUrl).href;
-                } else if (importSource.startsWith('http')) {
-                    downloadUrl = importSource;
-                } else if (importSource.startsWith('/')) {
-                     const origin = new URL(referrerUrl).origin;
-                     downloadUrl = new URL(importSource, origin).href;
-                } else {
-                    // Bare import in vendor? Assume fresh fetch from esm.sh
-                    // Use es2020 to ensure broad compatibility and reduced polyfill bloat
-                    downloadUrl = `https://esm.sh/${importSource}?target=es2020&bundle`;
-                }
-            } catch (e) {
-                console.warn("[Converter] Failed to resolve URL", importSource, referrerUrl);
-                return importSource;
-            }
-        } else {
-            // Root (User Code) Import
-            if (importSource.startsWith('.') || importSource.startsWith('/')) {
-                return importSource; // Local project file, ignore
-            }
-            if (importSource.startsWith('http')) {
-                downloadUrl = importSource;
-            } else {
-                // Bare specifier
-                downloadUrl = `https://esm.sh/${importSource}?target=es2020&bundle`;
-            }
-        }
+    // Detects libraries and converts CDN URLs to NPM package names
+    // Returns: Clean import source (e.g., 'three')
+    normalizeImport(source) {
+        if (!source || typeof source !== 'string') return source;
+        if (source.startsWith('.') || source.startsWith('/')) return source;
 
-        // 2. Check Cache
-        if (this.downloads.has(downloadUrl)) {
-            return this.downloads.get(downloadUrl).localPath;
-        }
-
-        // 3. Generate Local Path (Force .js)
-        let safeName = `vendor-${this.vendorCount++}`;
-        try {
-            const u = new URL(downloadUrl);
-            const pathParts = u.pathname.split('/');
-            const filename = pathParts[pathParts.length - 1];
-            if (filename && filename.length < 50) {
-                 const base = filename.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9.-]/g, '_');
-                 if (base) safeName = `${this.vendorCount}_${base}`;
-            }
-        } catch(e) {}
-        
-        const localPath = `./vendor/${safeName}.js`;
-
-        console.log(`[Converter] Resolving Dependency: ${importSource} -> ${downloadUrl} -> ${localPath}`);
-
-        // 4. Start Download & Recursion
-        const processPromise = (async () => {
-            try {
-                console.log(`[Converter] Downloading: ${downloadUrl}`);
-                const res = await fetch(downloadUrl);
-                if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
-                let code = await res.text();
-
-                // Sanitize vendor code to prevent CSP violations (eval, new Function)
-                
-                // 1. "new Function('return this')()" pattern -> window
-                code = code.replace(/new\s+Function\s*\(\s*["']return\s+this["']\s*\)\s*\(\)/g, 'window');
-                code = code.replace(/new\s+Function\s*\(\s*["']return\s+this["']\s*\)/g, '(()=>window)');
-                
-                // 2. "(0, eval)('this')" pattern -> window
-                code = code.replace(/\(0,\s*eval\)\s*\(\s*["']this["']\s*\)/g, 'window');
-                
-                // 3. "eval('this')" pattern -> window
-                code = code.replace(/\beval\s*\(\s*["']this["']\s*\)/g, 'window');
-
-                // 4. "Function('return this')()" (without new) -> window
-                code = code.replace(/Function\s*\(\s*["']return\s+this["']\s*\)\s*\(\)/g, 'window');
-                
-                // 5. Replace other common unsafe-eval patterns in webpack/polyfill code
-                code = code.replace(/Function\("return this"\)\(\)/g, 'window');
-
-                // Polyfill import.meta.url for environments that might choke on it or if bundling fails
-                code = code.replace(/import\.meta\.url/g, 'window.location.href');
-
-                // Use final URL for resolving relative imports (handling redirects)
-                const finalUrl = res.url;
-
-                // Recursively rewrite imports in this vendor file
-                const rewritePath = (specifier) => {
-                     // Resolve the specifier relative to this download
-                     const resolvedLocal = this.resolve(specifier, finalUrl);
-                     
-                     // resolvedLocal is ./vendor/xyz.js
-                     // Since this file is also in ./vendor/, imports should be ./xyz.js
-                     const parts = resolvedLocal.split('/');
-                     return `./${parts[parts.length - 1]}`;
-                };
-
-                // Use robust AST processing for vendor files too (they are minified/complex)
-                // We use the same processor but with a recursive resolver
-                const processed = processJsContentWithAst(code, rewritePath, `Vendor: ${safeName}`);
-                
-                return `// Source: ${downloadUrl}\n${processed.content}`;
-            } catch (err) {
-                console.error("[Converter] Vendor download error:", err);
-                return `/* Error downloading ${downloadUrl}: ${err.message} */`;
-            }
-        })();
-
-        this.downloads.set(downloadUrl, { localPath, processPromise });
-        return localPath;
-    }
-
-    async getVendorFiles() {
-        const files = {};
-        const processed = new Set();
-        
-        // Loop until no new downloads appear (handling recursion)
-        while(true) {
-            const urls = Array.from(this.downloads.keys());
-            let hasNew = false;
+        // 1. Three.js Handling
+        if (source.includes('/three') || source === 'three') {
+            this.dependencies['three'] = '^0.160.0';
             
-            for(const url of urls) {
-                if(processed.has(url)) continue;
-                hasNew = true;
-                processed.add(url);
-                
-                const entry = this.downloads.get(url);
-                const content = await entry.processPromise;
-                
-                const zipPath = entry.localPath.replace(/^\.\//, '');
-                files[zipPath] = content;
+            // Handle Addons (OrbitControls, GLTFLoader, etc.)
+            // Detect "examples/jsm" or "addons"
+            if (source.includes('examples/jsm') || source.includes('addons') || source.includes('controls')) {
+                // Try to extract the path after 'jsm'
+                const match = source.match(/(?:examples\/jsm|addons)\/(.+)/);
+                if (match) {
+                    let suffix = match[1];
+                    // Strip query params if any
+                    suffix = suffix.split('?')[0];
+                    if (!suffix.endsWith('.js')) suffix += '.js';
+                    return `three/examples/jsm/${suffix}`;
+                }
             }
-            if(!hasNew) break;
+            return 'three';
         }
-        return files;
-    }
-}
 
-// AST-based processing for safety against minified code issues
-function processJsContentWithAst(js, resolveFn, debugName = 'script') {
-    let isModule = false;
-    let ast;
+        // 2. Tween.js
+        if (source.toLowerCase().includes('tween')) {
+            this.dependencies['@tweenjs/tween.js'] = '^23.1.0';
+            return '@tweenjs/tween.js';
+        }
 
-    try {
-        ast = acorn.parse(js, { sourceType: 'module', ecmaVersion: 'latest', allowReturnOutsideFunction: true, allowHashBang: true });
-    } catch (e) {
-        console.warn(`[Converter] AST Parse failed for ${debugName}. Fallback to original content. Error:`, e.message);
-        // Fallback: If it fails to parse, we can't safely rewrite it. 
-        // We return original content. Note: If it has imports, they won't be rewritten, 
-        // likely leading to runtime errors, but better than corrupting code.
-        return { content: js, isModule: false }; 
-    }
+        // 3. Pixi.js
+        if (source.toLowerCase().includes('pixi')) {
+            this.dependencies['pixi.js'] = '^7.0.0';
+            return 'pixi.js';
+        }
 
-    const magic = new MagicString(js);
-
-    walkSimple(ast, {
-        ImportDeclaration(node) {
-            isModule = true;
-            if (node.source && node.source.value) {
-                const newPath = resolveFn(node.source.value);
-                if (newPath !== node.source.value) {
-                    magic.overwrite(node.source.start, node.source.end, JSON.stringify(newPath));
-                }
-            }
-        },
-        ExportNamedDeclaration(node) {
-            isModule = true;
-            if (node.source && node.source.value) {
-                const newPath = resolveFn(node.source.value);
-                if (newPath !== node.source.value) {
-                    magic.overwrite(node.source.start, node.source.end, JSON.stringify(newPath));
-                }
-            }
-        },
-        ExportAllDeclaration(node) {
-            isModule = true;
-            if (node.source && node.source.value) {
-                const newPath = resolveFn(node.source.value);
-                if (newPath !== node.source.value) {
-                    magic.overwrite(node.source.start, node.source.end, JSON.stringify(newPath));
-                }
-            }
-        },
-        ImportExpression(node) {
-            // dynamic import()
-            isModule = true; // Technically dynamic import works in scripts too, but implies modular intent
-            if (node.source && node.source.type === 'Literal') {
-                const newPath = resolveFn(node.source.value);
-                if (newPath !== node.source.value) {
-                    magic.overwrite(node.source.start, node.source.end, JSON.stringify(newPath));
-                }
-            }
-        },
-        MetaProperty(node) {
-            if (node.meta.name === 'import' && node.property.name === 'meta') {
-                isModule = true;
+        // 4. Generic esm.sh / unpkg Handling
+        // Capture package name: esm.sh/confetti-js@1.0.0
+        const pkgMatch = source.match(/(?:esm\.sh|unpkg\.com|jsdelivr\.net)\/(?:npm\/)?(@?[^@\/?]+)/);
+        if (pkgMatch) {
+            const pkg = pkgMatch[1];
+            // Filter out common non-packages or mistakes
+            if (pkg !== 'gh' && pkg !== 'npm') {
+                this.dependencies[pkg] = 'latest';
+                return pkg;
             }
         }
-    });
-
-    return { content: magic.toString(), isModule };
-}
-
-// Parse JS files to detect imports, download them, and rewrite paths
-export function processJsForImports(jsContent, depManager) {
-  let js = uint8ToString(jsContent);
-  
-  const resolveFn = (source) => {
-      // If it looks like a remote URL or bare import, resolve it
-      if (source.startsWith('http') || !source.match(/^\.?\.?\//)) {
-          return depManager.resolve(source);
-      }
-      return source;
-  };
-
-  return processJsContentWithAst(js, resolveFn, 'user-script');
-}
-
-// Parse HTML to extract scripts and handle import maps
-export function processHtmlForCSP(htmlContent, baseFilename, depManager, knownModules = new Set()) {
-  let html = uint8ToString(htmlContent);
-  const extractedScripts = [];
-  let scriptCounter = 0;
-
-  // Add DOCTYPE if missing
-  if (!html.trim().toLowerCase().startsWith('<!doctype')) {
-    html = '<!DOCTYPE html>\n' + html;
-  }
-
-  // 1. Inject Logger & Socket Polyfill
-  const polyfills = '<script src="logger.js"></script>\n    <script src="websim_socket.js"></script>';
-  if (html.includes('<head>')) {
-    html = html.replace('<head>', '<head>\n    ' + polyfills);
-  } else if (html.includes('<body>')) {
-    html = html.replace('<body>', '<body>\n    ' + polyfills);
-  } else {
-    html = polyfills + '\n' + html;
-  }
-
-  // 2. Handle Import Maps
-  // Remove import maps to prevent CSP inline script violations.
-  // We rewrite all imports in JS files (including extracted inline scripts) so the map is redundant.
-  html = html.replace(/<script\s+type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/gi, '<!-- Import Map Removed by Converter -->');
-
-  // 3. Process Scripts
-  html = html.replace(/<script([^>]*)>([\s\S]*?)<\/script>/gi, (match, attrs, content) => {
-    
-    // CASE A: External Script
-    const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
-    if (srcMatch) {
-        let src = srcMatch[1];
         
-        // If it's remote, we must download it!
-        if (src.startsWith('http') || src.startsWith('//')) {
-            if (src.startsWith('//')) src = 'https:' + src;
-            const localPath = depManager.resolve(src);
-            // resolve returns ./vendor/..., remove ./ for src attribute if needed, 
-            // but browsers handle ./ fine.
-            return `<script ${attrs.replace(srcMatch[0], `src="${localPath}"`)}>${content}</script>`;
+        // Return original if we can't map it (Vite might fail, but best effort)
+        return source;
+    }
+
+    // Rewrites JS imports to use NPM packages
+    processJS(jsContent, filename = 'script.js') {
+        const code = uint8ToString(jsContent);
+        let ast;
+        try {
+            ast = acorn.parse(code, { sourceType: 'module', ecmaVersion: 'latest', allowReturnOutsideFunction: true, allowHashBang: true });
+        } catch (e) {
+            console.warn(`[Analyzer] Parse error in ${filename}:`, e.message);
+            return code; // Return original if parse fails
         }
 
-        let filename = src;
-        // Clean path to match map keys
-        const cleanKey = filename.replace(/^(\.|\/)+/, '');
-        
-        if (knownModules.has(cleanKey)) {
-            if (!attrs.includes('type="module"') && !attrs.includes("type='module'")) {
-                return `<script type="module" ${attrs}>${content}</script>`;
+        const magic = new MagicString(code);
+        let hasChanges = false;
+
+        const rewrite = (node) => {
+            if (node.source && node.source.value) {
+                const newVal = this.normalizeImport(node.source.value);
+                if (newVal !== node.source.value) {
+                    magic.overwrite(node.source.start, node.source.end, JSON.stringify(newVal));
+                    hasChanges = true;
+                }
             }
+        };
+
+        walkSimple(ast, {
+            ImportDeclaration: rewrite,
+            ExportNamedDeclaration: rewrite,
+            ExportAllDeclaration: rewrite,
+            ImportExpression: (node) => { // dynamic import()
+                if (node.source.type === 'Literal') {
+                    const newVal = this.normalizeImport(node.source.value);
+                    if (newVal !== node.source.value) {
+                        magic.overwrite(node.source.start, node.source.end, JSON.stringify(newVal));
+                        hasChanges = true;
+                    }
+                }
+            }
+        });
+
+        // Remove "import { ... } from '...'" where import is a URL that might be purely side-effect or polyfill we don't need? 
+        // No, keep them, user intent matters.
+
+        return hasChanges ? magic.toString() : code;
+    }
+
+    // Process HTML: Remove import maps, extract inline scripts, inject polyfills
+    processHTML(htmlContent, filename) {
+        let html = uint8ToString(htmlContent);
+        const extractedScripts = [];
+        let scriptCounter = 0;
+
+        // Ensure DOCTYPE
+        if (!html.trim().toLowerCase().startsWith('<!doctype')) {
+            html = '<!DOCTYPE html>\n' + html;
         }
-        return match;
+
+        // 1. Remove Import Maps (Vite handles this)
+        html = html.replace(/<script\s+type=["']importmap["'][^>]*>([\s\S]*?)<\/script>/gi, '<!-- Import Map Removed by Converter -->');
+
+        // 2. Inject Polyfills (Logger, Socket) - Now extracted to separate files in client/
+        // We will inject <script src="./logger.js"></script> etc.
+        const polyfills = `<script type="module" src="./logger.js"></script>\n    <script type="module" src="./websim_socket.js"></script>`;
+        if (html.includes('<head>')) {
+            html = html.replace('<head>', '<head>\n    ' + polyfills);
+        } else {
+            html = polyfills + '\n' + html;
+        }
+
+        // 3. Process Scripts
+        html = html.replace(/<script([^>]*)>([\s\S]*?)<\/script>/gi, (match, attrs, content) => {
+            // Check src
+            const srcMatch = attrs.match(/src=["']([^"']+)["']/i);
+            if (srcMatch) {
+                const src = srcMatch[1];
+                // If remote script (http), try to map it? 
+                // Vite doesn't like remote scripts in index.html unless ignored.
+                // Best practice: Download it or ignore. 
+                // For this converter, we'll leave it, but warn?
+                // Actually, strict CSP means we should probably leave it and let Devvit block it or user fix it.
+                // But better: if it's a library, we might have mapped it? No, script tags are hard to map to npm deps automatically without import map.
+                return match; 
+            }
+
+            // Inline Script -> Extract to file
+            if (!content.trim()) return match;
+            
+            // Skip JSON/LD
+            if (attrs.includes('application/json')) return match;
+
+            scriptCounter++;
+            const safeName = filename.replace(/[^\w]/g, '_');
+            const newScriptName = `${safeName}_inline_${scriptCounter}.js`;
+            
+            // Process the content for imports too
+            const processedContent = this.processJS(content, newScriptName);
+            extractedScripts.push({ filename: newScriptName, content: processedContent });
+
+            // Force type="module" for Vite compatibility usually, or just keep original type?
+            // If it has imports, it must be module.
+            let newAttrs = attrs;
+            if (processedContent.includes('import ') && !newAttrs.includes('type="module"')) {
+                newAttrs += ' type="module"';
+            }
+
+            return `<script src="./${newScriptName}" ${newAttrs}></script>`;
+        });
+
+        // 4. Remove inline event handlers (CSP) - crude regex
+        html = html.replace(/\s+on\w+\s*=\s*["'][^"']*["']/gi, '');
+
+        return { html, extractedScripts };
     }
-
-    // CASE B: Inline Script
-    if (!content.trim()) return '';
-
-    // If it's a JSON script (importmap, ld+json), leave it alone
-    if (attrs.includes('type="application/json"') || attrs.includes('type="importmap"')) {
-        return match;
-    }
-
-    scriptCounter++;
-    const safeBase = baseFilename.replace(/[^\w-]/g, '_');
-    const scriptFilename = `${safeBase}_inline_${scriptCounter}.js`;
-    
-    let isModule = /\btype\s*=\s*["']module["']/i.test(attrs);
-    
-    const processed = processJsForImports(content, depManager);
-    if (processed.isModule) isModule = true;
-
-    extractedScripts.push({ filename: scriptFilename, content: processed.content });
-
-    let newAttrs = attrs;
-    if (isModule && !newAttrs.toLowerCase().includes('type="module"')) {
-        newAttrs += ' type="module"';
-    }
-    
-    return `<script src="${scriptFilename}" ${newAttrs}></script>`;
-  });
-
-  // Remove CSP violations
-  html = html.replace(/\s+on\w+\s*=\s*["'][^"']*["']/gi, '');
-
-  return { html, extractedScripts };
 }
 

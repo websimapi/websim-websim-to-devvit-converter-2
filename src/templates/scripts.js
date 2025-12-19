@@ -119,7 +119,16 @@ try {
     console.warn('⚠️ npm install had some issues, but continuing...');
 }
 
-// 3. Validation
+// 3. Build Client (Vite)
+console.log('🔨 Building Game Client...');
+try {
+    execSync('npm run build:client', { stdio: 'inherit' });
+} catch(e) {
+    console.error('❌ Build failed!');
+    process.exit(1);
+}
+
+// 4. Validation
 console.log('🧐 Validating assets...');
 try {
     execSync('node scripts/validate.js', { stdio: 'inherit' });
@@ -127,7 +136,7 @@ try {
     console.warn('⚠️ Validation found issues.');
 }
 
-// 4. Check Login
+// 5. Check Login
 console.log('🔒 Checking Devvit login status...');
 try {
     execSync('devvit whoami', { stdio: 'ignore' });
@@ -138,7 +147,7 @@ try {
     process.exit(1);
 }
 
-// 5. Register App
+// 6. Register App
 console.log('✨ Registering App on Reddit...');
 console.log('   IMPORTANT: If asked to create the app, please type "y" and press Enter!');
 try {
